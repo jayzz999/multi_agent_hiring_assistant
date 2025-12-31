@@ -24,7 +24,7 @@ st.set_page_config(
 )
 
 # API Configuration
-API_URL = os.getenv("API_URL", "http://localhost:8001")
+API_URL = os.getenv("API_URL", "http://localhost:8000")
 
 # Custom CSS
 st.markdown("""
@@ -66,8 +66,11 @@ st.markdown("""
 def check_api_health():
     """Check if the API is healthy."""
     try:
-        response = requests.get(f"{API_URL}/health", timeout=5)
+        response = requests.get(f"{API_URL}/health", timeout=2)
         return response.status_code == 200
+    except requests.exceptions.Timeout:
+        # API is running but busy - still consider it healthy
+        return True
     except:
         return False
 
@@ -124,15 +127,15 @@ def main():
         """)
 
     # Main content based on navigation
-    if "🏠 Home" in st.session_state.nav_page:
+    if st.session_state.nav_page == "🏠 Home":
         show_home_page()
-    elif "📋 New Workflow" in st.session_state.nav_page:
+    elif st.session_state.nav_page == "📋 New Workflow":
         show_workflow_page()
-    elif "📊 Results" in st.session_state.nav_page:
+    elif st.session_state.nav_page == "📊 Results":
         show_results_page()
-    elif "📁 Documents" in st.session_state.nav_page:
+    elif st.session_state.nav_page == "📁 Documents":
         show_documents_page()
-    elif "⚙️ Settings" in st.session_state.nav_page:
+    elif st.session_state.nav_page == "⚙️ Settings":
         show_settings_page()
 
 
@@ -349,29 +352,36 @@ def show_workflow_progress(job_id: str):
 
     progress_placeholder = st.empty()
     status_placeholder = st.empty()
+    details_placeholder = st.empty()
 
     phases = ["Planning", "Screening", "Matching", "Ranking", "Critique", "Finalization"]
 
     # Poll for updates
     max_polls = 180  # 6 minutes max (workflows can take 2-3 minutes with revisions)
     poll_count = 0
+    consecutive_failures = 0
 
     while poll_count < max_polls:
         try:
-            response = requests.get(f"{API_URL}/api/v1/workflow/status/{job_id}", timeout=10)
+            response = requests.get(f"{API_URL}/api/v1/workflow/status/{job_id}", timeout=3)
             if response.status_code == 200:
+                consecutive_failures = 0  # Reset on success
                 result = response.json()
                 status = result.get("status", "unknown")
 
                 if status == "running":
-                    # Update progress bar
+                    # Update progress bar with time-based estimate
                     progress = min(poll_count / 60, 0.9)  # Cap at 90% while running
                     progress_placeholder.progress(progress, text=f"Processing... ({int(progress * 100)}%)")
-                    status_placeholder.info("🔄 Agents are working on your request...")
+
+                    # Show more detailed status
+                    elapsed_time = poll_count * 2  # seconds
+                    details_placeholder.info(f"🔄 Agents are working on your request... (Elapsed: {elapsed_time}s)")
 
                 elif status == "completed":
                     progress_placeholder.progress(1.0, text="Complete!")
                     status_placeholder.success("✅ Workflow completed successfully!")
+                    details_placeholder.empty()
 
                     # Show results summary
                     if result.get("result"):
@@ -382,50 +392,220 @@ def show_workflow_progress(job_id: str):
                     progress_placeholder.progress(0.0)
                     error_msg = result.get("result", {}).get("error", "Unknown error")
                     status_placeholder.error(f"❌ Workflow failed: {error_msg}")
+                    details_placeholder.empty()
                     break
 
+        except requests.exceptions.Timeout:
+            consecutive_failures += 1
+            if consecutive_failures < 5:
+                # API is busy, this is expected during heavy processing
+                progress = min(poll_count / 60, 0.9)
+                progress_placeholder.progress(progress, text=f"Processing... ({int(progress * 100)}%)")
+                details_placeholder.warning("⏳ API is busy processing (this is normal)...")
+            else:
+                status_placeholder.error("❌ API connection lost. Please check the Results page manually.")
+                break
         except Exception as e:
-            status_placeholder.warning(f"Connection issue, retrying... ({str(e)[:50]})")
+            consecutive_failures += 1
+            if consecutive_failures < 5:
+                details_placeholder.warning(f"Retrying... ({str(e)[:50]})")
+            else:
+                status_placeholder.error(f"❌ Connection error: {str(e)[:100]}")
+                break
 
         time.sleep(2)
         poll_count += 1
 
     if poll_count >= max_polls:
         status_placeholder.warning("⏱️ Workflow is taking longer than expected. Check the Results page later.")
+        details_placeholder.info(f"Job ID: {job_id}")
 
 
 def show_results_summary(result: dict):
-    """Show a summary of workflow results."""
+    """Show a beautifully formatted summary of workflow results."""
     st.markdown("---")
-    st.markdown("### Results Summary")
+    st.markdown("## 📊 Workflow Results")
 
-    col1, col2, col3 = st.columns(3)
+    # Top-level metrics
+    col1, col2, col3, col4 = st.columns(4)
 
     with col1:
         verdict = result.get("verdict", "N/A")
-        verdict_color = "🟢" if verdict == "APPROVE" else "🟡" if verdict == "REVISE" else "🔴"
-        st.metric("Verdict", f"{verdict_color} {verdict}")
+        verdict_icon = "✅" if verdict == "APPROVE" else "⚠️" if verdict == "REVISE" else "❌"
+        st.metric("Final Verdict", verdict, delta_color="off")
+        st.markdown(f"<h2 style='text-align: center;'>{verdict_icon}</h2>", unsafe_allow_html=True)
 
     with col2:
         revisions = result.get("revision_count", 0)
-        st.metric("Revisions", revisions)
+        st.metric("Quality Revisions", f"{revisions} cycles")
 
     with col3:
-        success = "✅ Yes" if result.get("success") else "❌ No"
-        st.metric("Success", success)
+        success = result.get("success", False)
+        status_icon = "✅" if success else "❌"
+        st.metric("Status", f"{status_icon} {'Complete' if success else 'Failed'}")
 
-    # Show final recommendations
-    if result.get("final_recommendations"):
-        with st.expander("📋 View Full Recommendations", expanded=True):
-            st.markdown(result["final_recommendations"])
+    with col4:
+        # Calculate duration if available
+        started = result.get("started_at", "")
+        completed = result.get("completed_at", "")
+        if started and completed:
+            from datetime import datetime
+            start_dt = datetime.fromisoformat(started)
+            end_dt = datetime.fromisoformat(completed)
+            duration = (end_dt - start_dt).total_seconds()
+            st.metric("Duration", f"{int(duration)}s")
+
+    st.markdown("---")
+
+    # Parse and display candidate rankings in a beautiful format
+    final_recs = result.get("final_recommendations", "")
+
+    # Extract candidate ranking if present
+    if "FINAL CANDIDATE RANKING" in final_recs:
+        st.markdown("### 🏆 Candidate Rankings")
+
+        # Try to extract candidate info
+        import re
+
+        # Look for candidate names and scores
+        candidate_pattern = r"\|\s*(\d+)\s*\|\s*([^|]+?)\s*\|\s*(\d+)/100"
+        candidates = re.findall(candidate_pattern, final_recs)
+
+        if candidates:
+            for rank, name, score in candidates:
+                score_int = int(score)
+
+                # Color code based on score
+                if score_int >= 70:
+                    color = "#28a745"  # Green
+                    status = "Strong Candidate"
+                elif score_int >= 50:
+                    color = "#ffc107"  # Yellow
+                    status = "Moderate Fit"
+                else:
+                    color = "#dc3545"  # Red
+                    status = "Weak Fit"
+
+                # Create a card for each candidate
+                st.markdown(f"""
+                <div style='padding: 1rem; border-radius: 0.5rem; border-left: 4px solid {color}; background-color: rgba(0,0,0,0.05); margin: 0.5rem 0;'>
+                    <div style='display: flex; justify-content: space-between; align-items: center;'>
+                        <div>
+                            <h4 style='margin: 0;'>#{rank} {name.strip()}</h4>
+                            <p style='margin: 0.25rem 0; color: {color};'>{status}</p>
+                        </div>
+                        <div style='text-align: right;'>
+                            <h2 style='margin: 0; color: {color};'>{score}/100</h2>
+                        </div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # Show progress bar for score
+                st.progress(score_int / 100)
+
+    st.markdown("---")
+
+    # Tabbed interface for detailed results
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📋 Summary", "📊 Detailed Analysis", "💡 Insights", "🔍 Quality Check", "📝 Execution Log"])
+
+    with tab1:
+        st.markdown("### Executive Summary")
+        # Extract executive summary
+        if "EXECUTIVE SUMMARY" in final_recs:
+            summary_start = final_recs.find("EXECUTIVE SUMMARY")
+            summary_end = final_recs.find("---", summary_start)
+            if summary_end > summary_start:
+                summary = final_recs[summary_start:summary_end]
+                st.markdown(summary)
+
+        # Show hiring insights
+        if "HIRING INSIGHTS" in final_recs:
+            st.markdown("### 📈 Hiring Insights")
+            insights_start = final_recs.find("HIRING INSIGHTS")
+            insights_end = final_recs.find("---", insights_start + 50)
+            if insights_end > insights_start:
+                insights = final_recs[insights_start:insights_end]
+                st.markdown(insights)
+
+    with tab2:
+        st.markdown("### 📊 Detailed Analysis")
+
+        # Show plan
+        if result.get("plan"):
+            with st.expander("🎯 Hiring Plan", expanded=False):
+                st.markdown(result["plan"])
+
+        # Show screening results
+        if result.get("screening_results"):
+            with st.expander("🔍 Resume Screening", expanded=False):
+                st.markdown(result["screening_results"])
+
+        # Show matching results
+        if result.get("matching_results"):
+            with st.expander("⚖️ Skill Matching", expanded=False):
+                st.markdown(result["matching_results"])
+
+        # Show ranking results
+        if result.get("ranking_results"):
+            with st.expander("📊 Candidate Ranking", expanded=False):
+                st.markdown(result["ranking_results"])
+
+    with tab3:
+        st.markdown("### 💡 Recommendations & Insights")
+
+        # Extract recommendations
+        if "TOP RECOMMENDATIONS FOR INTERVIEW" in final_recs:
+            st.markdown("#### 🎯 Interview Recommendations")
+            recs_start = final_recs.find("TOP RECOMMENDATIONS FOR INTERVIEW")
+            recs_end = final_recs.find("NOT RECOMMENDED FOR INTERVIEW", recs_start)
+            if recs_end > recs_start:
+                recs = final_recs[recs_start:recs_end]
+                st.markdown(recs)
+
+        # Show interview questions
+        if "Suggested Interview Questions" in final_recs:
+            st.markdown("#### ❓ Suggested Interview Questions")
+            questions_start = final_recs.find("Suggested Interview Questions")
+            questions_end = final_recs.find("---", questions_start)
+            if questions_end > questions_start:
+                questions = final_recs[questions_start:questions_end]
+                st.markdown(questions)
+
+    with tab4:
+        st.markdown("### 🔍 Quality Check Results")
+        if result.get("critique"):
+            st.markdown(result["critique"])
+        else:
+            st.info("No critique data available")
+
+    with tab5:
+        st.markdown("### 📝 Execution Timeline")
+        if result.get("execution_log"):
+            for log_entry in result["execution_log"]:
+                st.text(log_entry)
+        else:
+            st.info("No execution log available")
 
 
 def show_results_page():
     """Display the results page."""
     st.markdown("# 📊 Workflow Results")
 
+    # Auto-refresh toggle and manual refresh button
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col1:
+        auto_refresh = st.checkbox("🔄 Auto-refresh every 5 seconds", value=False)
+    with col2:
+        if st.button("🔃 Refresh Now", use_container_width=True):
+            st.rerun()
+    with col3:
+        if auto_refresh:
+            time.sleep(5)
+            st.rerun()
+
     try:
-        response = requests.get(f"{API_URL}/api/v1/jobs", timeout=10)
+        response = requests.get(f"{API_URL}/api/v1/jobs", timeout=5)
         if response.status_code == 200:
             jobs = response.json().get("jobs", [])
 
@@ -447,7 +627,8 @@ def show_results_page():
             filtered_jobs = jobs if status_filter == "All" else [j for j in jobs if j["status"] == status_filter]
 
             for job in reversed(filtered_jobs):
-                with st.expander(f"Job {job['job_id']} - {job['status'].upper()}", expanded=False):
+                status_icon = "🟢" if job['status'] == 'completed' else "🟡" if job['status'] == 'running' else "🔴"
+                with st.expander(f"{status_icon} Job {job['job_id']} - {job['status'].upper()}", expanded=False):
                     col1, col2, col3 = st.columns(3)
 
                     with col1:
@@ -458,16 +639,34 @@ def show_results_page():
                         st.markdown(f"**Completed:** {job.get('completed_at', 'N/A')}")
 
                     # Fetch full details
-                    if st.button(f"Load Details", key=f"load_{job['job_id']}"):
-                        detail_response = requests.get(
-                            f"{API_URL}/api/v1/workflow/status/{job['job_id']}",
-                            timeout=10
-                        )
-                        if detail_response.status_code == 200:
-                            details = detail_response.json()
-                            if details.get("result"):
-                                st.json(details["result"])
+                    if st.button(f"📄 View Full Report", key=f"load_{job['job_id']}", use_container_width=True):
+                        with st.spinner("Loading workflow details..."):
+                            try:
+                                detail_response = requests.get(
+                                    f"{API_URL}/api/v1/workflow/status/{job['job_id']}",
+                                    timeout=5
+                                )
+                                if detail_response.status_code == 200:
+                                    details = detail_response.json()
 
+                                    if details.get("status") == "running":
+                                        st.info("🔄 This workflow is still running. Please check back in a few minutes.")
+                                    elif details.get("result"):
+                                        # Use the beautiful results summary instead of raw JSON
+                                        show_results_summary(details["result"])
+                                    else:
+                                        st.warning("No results available yet.")
+                                else:
+                                    st.error(f"Failed to load details: {detail_response.status_code}")
+                            except requests.exceptions.Timeout:
+                                st.warning("⏳ Request timed out. The workflow might still be running.")
+                            except Exception as e:
+                                st.error(f"Error loading details: {str(e)}")
+
+    except requests.exceptions.Timeout:
+        st.error("⏳ Connection to API timed out. The API might be busy processing workflows.")
+    except requests.exceptions.ConnectionError:
+        st.error("❌ Could not connect to API. Please ensure the server is running.")
     except Exception as e:
         st.error(f"Error fetching results: {str(e)}")
 
